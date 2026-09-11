@@ -1,0 +1,7 @@
+# Requirements for PeopleNetProto.py
+torch
+torchvision
+numpy
+opencv-python
+onnxruntime  # use onnxruntime-gpu if you need CUDA providers
+boxmot

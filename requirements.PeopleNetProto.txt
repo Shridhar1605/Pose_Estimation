@@ -1,0 +1,8 @@
+# Requirements for PeopleNetProto.py
+# Notes: install a matching `torch` + `torchvision` build for your CUDA version.
+onnxruntime-gpu
+torch
+torchvision
+numpy
+opencv-python
+boxmot

@@ -1,0 +1,8 @@
+# Requirements for pipelinePrototype.py
+torch
+torchvision
+ultralytics
+numpy
+opencv-python
+boxmot
+onnxruntime  # or onnxruntime-gpu for CUDA

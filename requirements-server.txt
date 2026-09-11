@@ -1,0 +1,5 @@
+# Additional requirements for server.py (on top of existing requirements.txt)
+# Install with: pip install -r requirements-server.txt
+fastapi
+uvicorn[standard]
+websockets

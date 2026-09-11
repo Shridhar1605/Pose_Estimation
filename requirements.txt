@@ -1,0 +1,11 @@
+# Combined requirements for PeopleNetProto.py and pipelinePrototype.py
+# This set is based on the current virtual environment in the workspace.
+# If you only need CPU inference, replace onnxruntime-gpu with onnxruntime.
+
+boxmot==21.0.0
+numpy==2.4.4
+opencv-python==4.13.0.92
+onnxruntime-gpu==1.26.0
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+ultralytics==8.4.63
