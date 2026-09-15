@@ -39,7 +39,7 @@ npm run dev                          # http://localhost:5173  (proxies /api and 
 
 Or simply `./run.sh` (dev, hot reload) / `./run.sh prod` (build once, single port 8000).
 
-Windows: `py -3.12 -m venv .venv && .venv\Scripts\activate`, then the same `pip`/`python` commands.
+**Windows:** follow [README_WINDOWS.md](README_WINDOWS.md). It covers PowerShell setup, the CUDA and DirectML installs, and running without `run.sh`.
 For NVIDIA GPUs see [requirements-cuda.txt](requirements-cuda.txt).
 
 ## Models
