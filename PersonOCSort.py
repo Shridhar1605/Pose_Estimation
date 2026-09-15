@@ -4,12 +4,11 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from boxmot.trackers.bbox.ocsort.ocsort import OcSort
 import torchvision
 
 #dataset link: https://www.kaggle.com/datasets/fmena14/crowd-counting
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
+from platform_utils import DEVICE, device_name, make_ocsort, make_ort_session  # CUDA -> MPS (macOS) -> CPU
+print(f"Using device: {DEVICE} ({device_name()})")
 
 model = YOLO("yolo26n.pt")
 model.to(DEVICE)  # or just pass device during inference
@@ -69,13 +68,7 @@ def detect_persons_robust(image):
 
 class OCSortTracker:
     def __init__(self, iou_threshold=0.3, max_lost=30, min_confidence=0.3):
-        self.tracker = OcSort(
-            det_thresh=min_confidence,
-            max_age=max_lost,
-            min_hits=1,
-            iou_threshold=iou_threshold,
-            per_class=False
-        )
+        self.tracker = make_ocsort(iou_threshold, max_lost, min_confidence)
 
     def update(self, detections, frame=None):
         if len(detections) == 0:
@@ -92,7 +85,7 @@ class OCSortTracker:
         
         tracked = []
         for r in res:
-            x1, y1, x2, y2, track_id, conf, cls, ind = r
+            x1, y1, x2, y2, track_id, conf = r[:6]
             tracked.append({
                 "id": int(track_id),
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],

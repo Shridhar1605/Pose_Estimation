@@ -1,314 +1,244 @@
 """
 Unified CV Pipeline Server
 ===========================
-Merges pipelinePrototype.py (YOLO) and PeopleNetProto.py (PeopleNet ONNX)
-into a single FastAPI backend with WebSocket live-relay streaming.
+The single pipeline that supports BOTH detectors:
 
-Supports:
-  - Model selection (YOLO variants + PeopleNet)
-  - Single-stream and multi-stream (up to 4) modes
-  - Emulated live relay from video files at native FPS
-  - Adaptive frame-skip to maintain ≥15 FPS per stream
-  - REST API for control + WebSocket for frame streaming
+  * YOLO26 (Ultralytics .pt weights, any file matching *.pt in the project root)
+  * NVIDIA PeopleNet (ResNet34 INT8 ONNX, _/resnet34_peoplenet_int8.onnx)
+
+followed by the shared stages: OC-SORT tracking -> RTMPose keypoints -> rule
+based action classification (STANDING / SITTING / LYING DOWN / FIGHTING).
+
+Cross-platform: runs on macOS (Apple Silicon: YOLO on Metal/MPS, ONNX models on
+CoreML), Linux/Windows (CUDA) and plain CPU. Device selection lives in
+platform_utils.py.
+
+Endpoints
+---------
+  GET  /api/system            runtime + hardware summary
+  GET  /api/models            discovered models
+  GET  /api/videos            discovered video sources
+  POST /api/folders           add a folder to scan for videos   {"path": "..."}
+  POST /api/upload            upload a video file (multipart)
+  GET  /api/status            live status of running streams
+  POST /api/start             {"model": "...", "mode": "single|multi", "videos": [...]}
+  POST /api/stop
+  WS   /ws/stream             JSON frames: {type:"frame", stream_id, frame(b64 jpeg), fps, tracks, ...}
+  GET  /                      the built dashboard (dashboard/dist) when present
 
 Run:
-  python server.py
+  .venv/bin/python server.py            # http://localhost:8000
 """
+from __future__ import annotations
 
-import os
-import sys
-import time
-import json
-import glob
-import base64
+# platform_utils must be imported before torch / onnxruntime / cv2
+from platform_utils import (  # noqa: E402
+    DEVICE, IS_MAC, device_name, get_ort_providers, make_ocsort, make_ort_session,
+    system_summary,
+)
+
 import asyncio
+import base64
+import glob
+import json
+import os
+import platform
+import re
+import shutil
 import threading
+import time
 import traceback
+from collections import Counter, deque
 from enum import Enum
 from typing import Optional
+
+import logging
 
 import cv2
 import numpy as np
 import torch
 import torchvision
 
-# ---------------------------------------------------------------------------
-# Fix ORT DLL loading on Windows (PyTorch bundles cuDNN)
-# ---------------------------------------------------------------------------
-torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-if torch_lib not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+logging.getLogger("boxmot").setLevel(logging.WARNING)  # silence per-tracker INFO banners
 
-import onnxruntime as ort
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"[server] Using device: {DEVICE}")
+print(f"[server] torch device: {DEVICE} ({device_name()}) | ORT providers: {get_ort_providers()}")
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(PROJECT_ROOT, "Video_samples", "uploads")
 VIDEO_DIRS = [
     os.path.join(PROJECT_ROOT, "Video_samples"),
-    os.path.join(PROJECT_ROOT, "Internship project resource videos"),
+    os.path.join(PROJECT_ROOT, "videos"),
     os.path.join(PROJECT_ROOT, "Pose_Samples"),
+    os.path.join(PROJECT_ROOT, "Internship project resource videos"),
 ]
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".ts", ".flv", ".m4v"}
+MAX_STREAMS = 4
+STREAM_URL_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
 
 # ============================================================================
-#  CV Pipeline Components (merged & deduplicated from both prototypes)
+#  CV Pipeline Components
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# PeopleNet Detector (from PeopleNetProto.py)
+# PeopleNet Detector (DetectNet_v2 GridBox decoder)
 # ---------------------------------------------------------------------------
 class PeopleNetDetector:
-    """PeopleNet ResNet34 INT8 ONNX detector — replaces YOLO for person detection."""
+    """NVIDIA PeopleNet ResNet34 INT8 ONNX detector (person / bag / face)."""
     PERSON_CLASS = 0
-    STRIDE       = 16
-    INPUT_W      = 960
-    INPUT_H      = 544
-    SCALE        = 1.0 / 255.0
+    STRIDE = 16
+    INPUT_W = 960
+    INPUT_H = 544
+    SCALE = 1.0 / 255.0
+    BBOX_NORM = 35.0  # DetectNet_v2 bbox scale
 
     def __init__(self, model_path="_/resnet34_peoplenet_int8.onnx"):
-        self.model_path = os.path.join(PROJECT_ROOT, model_path)
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if torch.cuda.is_available()
-            else ["CPUExecutionProvider"]
-        )
-        sess_opts = ort.SessionOptions()
-        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            self.session = ort.InferenceSession(
-                self.model_path, sess_options=sess_opts, providers=providers
-            )
-        except Exception as e:
-            print(f"[PeopleNet] CUDA provider failed ({e}). Falling back to CPU.")
-            self.session = ort.InferenceSession(
-                self.model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
-            )
+        self.model_path = model_path if os.path.isabs(model_path) else os.path.join(PROJECT_ROOT, model_path)
+        self.session = make_ort_session(self.model_path, log_prefix="[PeopleNet]")
         self.input_name = self.session.get_inputs()[0].name
-        out_names = [o.name for o in self.session.get_outputs()]
-        out_shapes = [self.session.get_outputs()[i].shape for i in range(len(out_names))]
+        out_shapes = [o.shape for o in self.session.get_outputs()]
         self._cov_idx, self._bbox_idx = self._resolve_output_indices(out_shapes)
         self._lock = threading.Lock()
-        print(f"[PeopleNet] Loaded | outputs: {out_names} | providers: {self.session.get_providers()}")
+        print(f"[PeopleNet] loaded {os.path.basename(self.model_path)} | providers: {self.session.get_providers()}")
 
     @staticmethod
     def _resolve_output_indices(shapes):
         for i, s in enumerate(shapes):
-            if len(s) == 4 and s[1] in (3, 12):
-                if s[1] == 3:
-                    return i, 1 - i
+            if len(s) == 4 and s[1] == 3:
+                return i, 1 - i
         return 0, 1
 
     def preprocess(self, bgr_frame):
         shape = bgr_frame.shape[:2]
         r = min(self.INPUT_W / shape[1], self.INPUT_H / shape[0])
         new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-        dw, dh = self.INPUT_W - new_unpad[0], self.INPUT_H - new_unpad[1]
-        dw /= 2
-        dh /= 2
-        if shape[::-1] != new_unpad:
-            resized = cv2.resize(bgr_frame, new_unpad, interpolation=cv2.INTER_LINEAR)
-        else:
-            resized = bgr_frame
+        dw, dh = (self.INPUT_W - new_unpad[0]) / 2, (self.INPUT_H - new_unpad[1]) / 2
+        resized = cv2.resize(bgr_frame, new_unpad, interpolation=cv2.INTER_LINEAR) if shape[::-1] != new_unpad else bgr_frame
         top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
         padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        # In-place conversion to avoid creating multiple large temporary arrays
         blob = padded.astype(np.float32)
-        blob *= self.SCALE  # in-place multiply — no extra copy
+        blob *= self.SCALE
         blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[np.newaxis, ...])
         return blob, r, dw, dh
 
     def detect(self, bgr_frame, conf_threshold=0.4, nms_iou=0.45):
-        orig_h, orig_w = bgr_frame.shape[:2]
         blob, r, dw, dh = self.preprocess(bgr_frame)
         with self._lock:
             outputs = self.session.run(None, {self.input_name: blob})
-        cov_map = outputs[self._cov_idx]
-        bbox_map = outputs[self._bbox_idx]
+        cov_map, bbox_map = outputs[self._cov_idx], outputs[self._bbox_idx]
 
-        person_scores = cov_map[0, self.PERSON_CLASS]
         c = self.PERSON_CLASS
-        bx1_map = bbox_map[0, c * 4 + 0]
-        by1_map = bbox_map[0, c * 4 + 1]
-        bx2_map = bbox_map[0, c * 4 + 2]
-        by2_map = bbox_map[0, c * 4 + 3]
-
-        grid_h, grid_w = person_scores.shape
-        gy_idx, gx_idx = np.where(person_scores > conf_threshold)
-
-        if len(gy_idx) == 0:
+        person_scores = cov_map[0, c]
+        gy, gx = np.where(person_scores > conf_threshold)
+        if len(gy) == 0:
             return np.empty((0, 5))
 
-        NORM = 35.0
-        L = bx1_map[gy_idx, gx_idx]
-        T = by1_map[gy_idx, gx_idx]
-        R = bx2_map[gy_idx, gx_idx]
-        B = by2_map[gy_idx, gx_idx]
-        scores = person_scores[gy_idx, gx_idx]
+        L, T = bbox_map[0, c * 4 + 0][gy, gx], bbox_map[0, c * 4 + 1][gy, gx]
+        R, B = bbox_map[0, c * 4 + 2][gy, gx], bbox_map[0, c * 4 + 3][gy, gx]
+        scores = person_scores[gy, gx]
+        cx = gx * self.STRIDE + self.STRIDE / 2.0
+        cy = gy * self.STRIDE + self.STRIDE / 2.0
 
-        cx = gx_idx * self.STRIDE + self.STRIDE / 2.0
-        cy = gy_idx * self.STRIDE + self.STRIDE / 2.0
+        x1 = np.clip(cx - L * self.BBOX_NORM, 0, self.INPUT_W)
+        y1 = np.clip(cy - T * self.BBOX_NORM, 0, self.INPUT_H)
+        x2 = np.clip(cx + R * self.BBOX_NORM, 0, self.INPUT_W)
+        y2 = np.clip(cy + B * self.BBOX_NORM, 0, self.INPUT_H)
+        x1, x2 = (x1 - dw) / r, (x2 - dw) / r
+        y1, y2 = (y1 - dh) / r, (y2 - dh) / r
 
-        x1s = cx - L * NORM
-        y1s = cy - T * NORM
-        x2s = cx + R * NORM
-        y2s = cy + B * NORM
-
-        x1s = np.clip(x1s, 0, self.INPUT_W)
-        y1s = np.clip(y1s, 0, self.INPUT_H)
-        x2s = np.clip(x2s, 0, self.INPUT_W)
-        y2s = np.clip(y2s, 0, self.INPUT_H)
-
-        x1s = (x1s - dw) / r
-        x2s = (x2s - dw) / r
-        y1s = (y1s - dh) / r
-        y2s = (y2s - dh) / r
-
-        valid = (x2s > x1s) & (y2s > y1s)
+        valid = (x2 > x1) & (y2 > y1)
         if not np.any(valid):
             return np.empty((0, 5))
-
-        boxes_t = torch.from_numpy(
-            np.stack([x1s[valid], y1s[valid], x2s[valid], y2s[valid]], axis=1).astype(np.float32)
-        )
+        boxes_t = torch.from_numpy(np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1).astype(np.float32))
         scores_t = torch.from_numpy(scores[valid].astype(np.float32))
-        keep = torchvision.ops.nms(boxes_t, scores_t, nms_iou)
-
-        kept_boxes = boxes_t[keep].numpy()
-        kept_scores = scores_t[keep].numpy().reshape(-1, 1)
-        return np.concatenate([kept_boxes, kept_scores], axis=1)
+        keep = torchvision.ops.nms(boxes_t, scores_t, nms_iou)  # CPU tensors -> works on every platform
+        return np.concatenate([boxes_t[keep].numpy(), scores_t[keep].numpy().reshape(-1, 1)], axis=1)
 
 
 # ---------------------------------------------------------------------------
-# RTMPose Wrapper (shared by both pipelines)
+# RTMPose (SimCC) keypoint estimator
 # ---------------------------------------------------------------------------
 class RTMPoseWrapper:
+    INPUT_W, INPUT_H = 192, 256
+    MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    STD = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+
     def __init__(self, model_path="rtmpose-s.onnx"):
-        self.model_path = os.path.join(PROJECT_ROOT, model_path)
+        self.model_path = model_path if os.path.isabs(model_path) else os.path.join(PROJECT_ROOT, model_path)
         self.session = None
         self._lock = threading.Lock()
         if os.path.exists(self.model_path):
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
-            try:
-                self.session = ort.InferenceSession(self.model_path, providers=providers)
-            except Exception as e:
-                print(f"[RTMPose] CUDA provider failed ({e}). Falling back to CPU.")
-                self.session = ort.InferenceSession(self.model_path, providers=["CPUExecutionProvider"])
-            print(f"[RTMPose] Loaded from {self.model_path}")
+            self.session = make_ort_session(self.model_path, log_prefix="[RTMPose]")
+            self.input_name = self.session.get_inputs()[0].name
+            print(f"[RTMPose] loaded {os.path.basename(self.model_path)} | providers: {self.session.get_providers()}")
         else:
-            print(f"[RTMPose] Warning: {self.model_path} not found. Using dummy keypoints.")
+            print(f"[RTMPose] {self.model_path} not found -> action classifier will use placeholder keypoints")
+
+    @property
+    def available(self) -> bool:
+        return self.session is not None
 
     def infer(self, roi):
-        if self.session is None:
-            h, w = roi.shape[:2]
-            dummy_kps = np.zeros((17, 3))
-            dummy_kps[:, 0] = w / 2
-            dummy_kps[:, 1] = h / 2
-            dummy_kps[:, 2] = 0.9
-            dummy_kps[5, 1] = h * 0.2
-            dummy_kps[6, 1] = h * 0.2
-            dummy_kps[11, 1] = h * 0.6
-            dummy_kps[12, 1] = h * 0.6
-            return dummy_kps, np.ones(17) * 0.9
-
         h, w = roi.shape[:2]
-        input_size = (192, 256)
-        resized = cv2.resize(roi, input_size)
-        img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
-        std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
-        img = (img - mean) / std
-        img = img.transpose(2, 0, 1)
-        img = np.expand_dims(img, axis=0).astype(np.float32)
+        if self.session is None:
+            kps = np.zeros((17, 3))
+            kps[:, 0], kps[:, 1], kps[:, 2] = w / 2, h / 2, 0.9
+            kps[5, 1] = kps[6, 1] = h * 0.2
+            kps[11, 1] = kps[12, 1] = h * 0.6
+            return kps, np.ones(17) * 0.9
 
-        input_name = self.session.get_inputs()[0].name
+        img = cv2.cvtColor(cv2.resize(roi, (self.INPUT_W, self.INPUT_H)), cv2.COLOR_BGR2RGB).astype(np.float32)
+        img = (img - self.MEAN) / self.STD
+        img = np.ascontiguousarray(img.transpose(2, 0, 1)[np.newaxis, ...], dtype=np.float32)
         with self._lock:
-            outputs = self.session.run(None, {input_name: img})
-        simcc_x, simcc_y = outputs[0][0], outputs[1][0]
-
-        x_locs = np.argmax(simcc_x, axis=1)
-        y_locs = np.argmax(simcc_y, axis=1)
-        scores_x = np.max(simcc_x, axis=1)
-        scores_y = np.max(simcc_y, axis=1)
-        scores = (scores_x + scores_y) / 2
-
-        keypoints = np.zeros((17, 3))
-        keypoints[:, 0] = x_locs / (192 * 2) * w
-        keypoints[:, 1] = y_locs / (256 * 2) * h
-        keypoints[:, 2] = scores
-
-        return keypoints, scores
+            simcc_x, simcc_y = self.session.run(None, {self.input_name: img})
+        simcc_x, simcc_y = simcc_x[0], simcc_y[0]
+        x_locs, y_locs = np.argmax(simcc_x, axis=1), np.argmax(simcc_y, axis=1)
+        scores = (np.max(simcc_x, axis=1) + np.max(simcc_y, axis=1)) / 2
+        kps = np.zeros((17, 3))
+        kps[:, 0] = x_locs / (self.INPUT_W * 2) * w
+        kps[:, 1] = y_locs / (self.INPUT_H * 2) * h
+        kps[:, 2] = scores
+        return kps, scores
 
 
 # ---------------------------------------------------------------------------
-# OC-SORT Tracker (shared)
+# OC-SORT tracker wrapper
 # ---------------------------------------------------------------------------
-from boxmot.trackers.bbox.ocsort.ocsort import OcSort
-
 class OCSortTracker:
     def __init__(self, iou_threshold=0.25, max_lost=60, min_confidence=0.25):
-        try:
-            self.tracker = OcSort(
-                det_thresh=min_confidence,
-                max_age=max_lost,
-                min_hits=2,
-                iou_threshold=iou_threshold,
-                delta_t=3,
-                asso_func="iou",
-                inertia=0.2,
-                per_class=False
-            )
-        except TypeError:
-            print("[OC-SORT] Strict parameters failed, falling back to safe kwargs")
-            self.tracker = OcSort(
-                det_thresh=min_confidence,
-                max_age=max_lost,
-                min_hits=2,
-                iou_threshold=iou_threshold,
-                per_class=False
-            )
+        self.tracker = make_ocsort(iou_threshold, max_lost, min_confidence)
 
     def update(self, detections, frame=None):
         if len(detections) == 0:
             dets_np = np.empty((0, 6), dtype=np.float32)
         else:
-            dets_np = np.array(detections, dtype=np.float32)
-            cls_col = np.zeros((dets_np.shape[0], 1), dtype=np.float32)
-            dets_np = np.concatenate([dets_np, cls_col], axis=1)
-
+            dets_np = np.asarray(detections, dtype=np.float32)
+            dets_np = np.concatenate([dets_np, np.zeros((dets_np.shape[0], 1), dtype=np.float32)], axis=1)
         if frame is None:
             frame = np.zeros((100, 100, 3), dtype=np.uint8)
-
         res = self.tracker.update(dets_np, frame)
         tracked = []
         for r in res:
-            x1, y1, x2, y2, track_id, conf, cls, ind = r
-            tracked.append({
-                "id": int(track_id),
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "score": float(conf)
-            })
+            x1, y1, x2, y2, track_id, conf = r[:6]
+            tracked.append({"id": int(track_id), "bbox": [float(x1), float(y1), float(x2), float(y2)], "score": float(conf)})
         return tracked
 
 
 # ---------------------------------------------------------------------------
-# Action Classifier (shared)
+# Action classifier (COCO-17 keypoints, rule based)
 # ---------------------------------------------------------------------------
 def classify_action(keypoints, keypoint_history, bbox_height):
-    """
-    Classifies person action: STANDING, SITTING, FIGHTING, or LYING DOWN
-    based on RTMPose 17-keypoint output (COCO format).
-    """
     if keypoints is None or len(keypoints) < 17:
         return "UNKNOWN", 0.0
 
@@ -316,46 +246,37 @@ def classify_action(keypoints, keypoint_history, bbox_height):
         return keypoints[idx][2] > thresh
 
     shoulders_vis = visible(5) and visible(6)
-    hips_vis      = visible(11) and visible(12)
-    knees_vis     = visible(13) and visible(14)
-    ankles_vis    = visible(15) and visible(16)
-
+    hips_vis = visible(11) and visible(12)
+    knees_vis = visible(13) and visible(14)
+    ankles_vis = visible(15) and visible(16)
     shoulder_y = (keypoints[5][1] + keypoints[6][1]) / 2 if shoulders_vis else None
-    hip_y      = (keypoints[11][1] + keypoints[12][1]) / 2 if hips_vis else None
-    knee_y     = (keypoints[13][1] + keypoints[14][1]) / 2 if knees_vis else None
-    ankle_y    = (keypoints[15][1] + keypoints[16][1]) / 2 if ankles_vis else None
-
+    hip_y = (keypoints[11][1] + keypoints[12][1]) / 2 if hips_vis else None
+    knee_y = (keypoints[13][1] + keypoints[14][1]) / 2 if knees_vis else None
+    ankle_y = (keypoints[15][1] + keypoints[16][1]) / 2 if ankles_vis else None
     bh = bbox_height if bbox_height > 1 else 1
 
-    # LYING DOWN
     if shoulders_vis and hips_vis:
         vertical_delta = abs(shoulder_y - hip_y) / bh
         if vertical_delta < 0.24:
             return "LYING DOWN", min(1.0, 1.0 - vertical_delta / 0.24)
 
-    # SITTING
     if shoulders_vis and hips_vis and knees_vis:
         hip_to_shoulder = (hip_y - shoulder_y) / bh
         knee_to_hip = (hip_y - knee_y) / bh
         if hip_to_shoulder > 0.15 and knee_to_hip > -0.05:
             if ankle_y is not None:
-                knee_ankle_gap = (ankle_y - knee_y) / bh
-                if knee_ankle_gap < 0.25:
+                if (ankle_y - knee_y) / bh < 0.25:
                     return "SITTING", 0.75
             else:
                 return "SITTING", 0.65
 
-    # FIGHTING
     arms_raised = False
     if visible(7) and visible(8) and shoulders_vis:
-        elbow_y = (keypoints[7][1] + keypoints[8][1]) / 1.5
-        if elbow_y < shoulder_y:
+        if (keypoints[7][1] + keypoints[8][1]) / 1.5 < shoulder_y:
             arms_raised = True
-    if not arms_raised and (visible(9) or visible(10)):
-        wrist_ys = []
-        if visible(9): wrist_ys.append(keypoints[9][1])
-        if visible(10): wrist_ys.append(keypoints[10][1])
-        if shoulder_y is not None and any(w < shoulder_y for w in wrist_ys):
+    if not arms_raised and (visible(9) or visible(10)) and shoulder_y is not None:
+        wrist_ys = [keypoints[i][1] for i in (9, 10) if visible(i)]
+        if any(w < shoulder_y for w in wrist_ys):
             arms_raised = True
 
     if arms_raised and len(keypoint_history) >= 5:
@@ -363,23 +284,19 @@ def classify_action(keypoints, keypoint_history, bbox_height):
         for entry in keypoint_history[-8:]:
             kps = entry.get("kps")
             if kps is not None and len(kps) >= 17:
-                wx = (kps[9][0] + kps[10][0]) / 2
-                wy = (kps[9][1] + kps[10][1]) / 2
-                wrist_positions.append((wx, wy))
+                wrist_positions.append(((kps[9][0] + kps[10][0]) / 2, (kps[9][1] + kps[10][1]) / 2))
         if len(wrist_positions) >= 3:
-            dists = [((wrist_positions[i][0] - wrist_positions[i-1][0])**2 +
-                      (wrist_positions[i][1] - wrist_positions[i-1][1])**2)**0.5
+            dists = [np.hypot(wrist_positions[i][0] - wrist_positions[i - 1][0],
+                              wrist_positions[i][1] - wrist_positions[i - 1][1])
                      for i in range(1, len(wrist_positions))]
             avg_speed = sum(dists) / len(dists)
             if avg_speed > 6.0:
                 return "FIGHTING", min(1.0, avg_speed / 25.0)
 
-    # STANDING (default)
     if shoulders_vis and hips_vis:
         upright_ratio = (hip_y - shoulder_y) / bh
         if upright_ratio > 0.15:
             return "STANDING", min(1.0, upright_ratio / 0.5)
-
     return "STANDING", 0.5
 
 
@@ -388,176 +305,206 @@ def classify_action(keypoints, keypoint_history, bbox_height):
 # ---------------------------------------------------------------------------
 SKELETON = [
     (15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11), (6, 12), (5, 6),
-    (5, 7), (6, 8), (7, 9), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6)
+    (5, 7), (6, 8), (7, 9), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6),
 ]
-
-ACTION_COLORS = {
-    "STANDING":   (0, 255, 0),
-    "SITTING":    (0, 255, 255),
-    "LYING DOWN": (0, 0, 255),
-    "FIGHTING":   (0, 128, 255),
-    "UNKNOWN":    (128, 128, 128),
+ACTION_COLORS = {  # BGR - same colorblind-safe palette the dashboard uses (validated)
+    "STANDING": (138, 166, 34),     # #22A68A teal
+    "SITTING": (20, 138, 192),      # #C08A14 amber
+    "LYING DOWN": (102, 67, 217),   # #D94366 rose
+    "FIGHTING": (234, 113, 131),    # #8371EA violet
+    "UNKNOWN": (132, 118, 107),     # #6B7684 slate
 }
+
 
 def crop_with_padding(frame, bbox, pad=20):
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, bbox)
-    rx1 = max(0, x1 - pad)
-    ry1 = max(0, y1 - pad)
-    rx2 = min(w, x2 + pad)
-    ry2 = min(h, y2 + pad)
+    rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+    rx2, ry2 = min(w, x2 + pad), min(h, y2 + pad)
     return frame[ry1:ry2, rx1:rx2], rx1, ry1
+
 
 def draw_skeleton(frame, keypoints, rx1, ry1):
     if keypoints is None or len(keypoints) < 17:
         return
     for i, j in SKELETON:
-        kp1 = keypoints[i]
-        kp2 = keypoints[j]
+        kp1, kp2 = keypoints[i], keypoints[j]
         if kp1[2] > 0.3 and kp2[2] > 0.3:
-            pt1 = (int(kp1[0] + rx1), int(kp1[1] + ry1))
-            pt2 = (int(kp2[0] + rx1), int(kp2[1] + ry1))
-            cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
+            cv2.line(frame, (int(kp1[0] + rx1), int(kp1[1] + ry1)), (int(kp2[0] + rx1), int(kp2[1] + ry1)), (255, 0, 255), 2)
     for kp in keypoints:
         if kp[2] > 0.3:
-            pt = (int(kp[0] + rx1), int(kp[1] + ry1))
-            cv2.circle(frame, pt, 4, (0, 255, 255), -1)
+            cv2.circle(frame, (int(kp[0] + rx1), int(kp[1] + ry1)), 3, (0, 255, 255), -1)
 
-def draw_annotations(frame, tracked, track_states, track_history):
-    """Draw bounding boxes, labels, and skeletons on a frame."""
+
+def draw_annotations(frame, tracked, track_states, track_history, draw_pose=True):
     for track in tracked:
         x1, y1, x2, y2 = map(int, track["bbox"])
-        track_id = track["id"]
-        state_info = track_states.get(track_id, {"action": "STANDING", "conf": 0.5})
-        action = state_info["action"]
-        action_conf = state_info["conf"]
-
-        color = ACTION_COLORS.get(action, (0, 255, 0))
-        label = f"ID:{track_id} {action} ({action_conf:.2f})"
+        tid = track["id"]
+        state = track_states.get(tid, {"action": "STANDING", "conf": 0.5})
+        color = ACTION_COLORS.get(state["action"], (0, 255, 0))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(0, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        if track_id in track_history and len(track_history[track_id]) > 0:
-            last = track_history[track_id][-1]
+        label = f"#{tid} {state['action']} {state['conf']:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ly = max(th + 6, y1)
+        lx = min(max(0, x1), frame.shape[1] - tw - 6)  # keep label inside the frame
+        cv2.rectangle(frame, (lx, ly - th - 6), (lx + tw + 6, ly), color, -1)
+        cv2.putText(frame, label, (lx + 3, ly - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (15, 15, 15), 1, cv2.LINE_AA)
+        if draw_pose and track_history.get(tid):
+            last = track_history[tid][-1]
             draw_skeleton(frame, last.get("kps"), last.get("rx1", 0), last.get("ry1", 0))
-
-    count_label = f"Active Persons: {len(tracked)}"
-    cv2.putText(frame, count_label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
 
 # ============================================================================
-#  Model Registry
+#  Model registry
 # ============================================================================
 class ModelType(Enum):
     YOLO = "yolo"
     PEOPLENET = "peoplenet"
 
-# Map of model_name -> (type, file_or_path)
-MODEL_REGISTRY = {}
+
+MODEL_REGISTRY: dict[str, tuple[ModelType, str]] = {}
+PEOPLENET_PATH = os.path.join(PROJECT_ROOT, "_", "resnet34_peoplenet_int8.onnx")
+
 
 def _discover_models():
-    """Discover available YOLO .pt files and PeopleNet ONNX in project root."""
-    global MODEL_REGISTRY
-    MODEL_REGISTRY = {}
+    MODEL_REGISTRY.clear()
+    for pt_file in sorted(glob.glob(os.path.join(PROJECT_ROOT, "*.pt"))):
+        MODEL_REGISTRY[os.path.splitext(os.path.basename(pt_file))[0]] = (ModelType.YOLO, pt_file)
+    if os.path.exists(PEOPLENET_PATH):
+        MODEL_REGISTRY["peoplenet"] = (ModelType.PEOPLENET, PEOPLENET_PATH)
+    print(f"[Models] discovered: {list(MODEL_REGISTRY.keys())}")
 
-    # Discover all .pt model files in project root
-    for pt_file in glob.glob(os.path.join(PROJECT_ROOT, "*.pt")):
-        name = os.path.splitext(os.path.basename(pt_file))[0]
-        MODEL_REGISTRY[name] = (ModelType.YOLO, pt_file)
-
-    # PeopleNet
-    peoplenet_path = os.path.join(PROJECT_ROOT, "_", "resnet34_peoplenet_int8.onnx")
-    if os.path.exists(peoplenet_path):
-        MODEL_REGISTRY["peoplenet"] = (ModelType.PEOPLENET, peoplenet_path)
-
-    print(f"[Models] Discovered: {list(MODEL_REGISTRY.keys())}")
 
 _discover_models()
 
-# Cached model instances (lazy-loaded)
-_loaded_models = {}
+_loaded_models: dict[str, tuple[str, object]] = {}
 _model_lock = threading.Lock()
+_yolo_locks: dict[str, threading.Lock] = {}
+_inference_semaphore = threading.Semaphore(2)
+
 
 def get_model(model_name: str):
-    """Get or load a model instance by name."""
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(MODEL_REGISTRY.keys())}")
-
     with _model_lock:
         if model_name in _loaded_models:
             return _loaded_models[model_name]
-
         model_type, model_path = MODEL_REGISTRY[model_name]
         if model_type == ModelType.YOLO:
             from ultralytics import YOLO
             model = YOLO(model_path)
             model.to(DEVICE)
+            # warm-up so the first live frame is not slow (MPS compiles kernels lazily)
+            model.predict(np.zeros((640, 640, 3), dtype=np.uint8), device=DEVICE, verbose=False, imgsz=640)
+            _yolo_locks[model_name] = threading.Lock()
             _loaded_models[model_name] = ("yolo", model)
-            print(f"[Models] Loaded YOLO model: {model_name}")
-        elif model_type == ModelType.PEOPLENET:
-            model = PeopleNetDetector(model_path)
-            _loaded_models[model_name] = ("peoplenet", model)
-            print(f"[Models] Loaded PeopleNet model")
-
+            print(f"[Models] loaded YOLO '{model_name}' on {DEVICE} | classes: {model.names}")
+        else:
+            _loaded_models[model_name] = ("peoplenet", PeopleNetDetector(model_path))
         return _loaded_models[model_name]
 
 
-# Limit concurrent inference calls to prevent memory pressure crashes
-_inference_semaphore = threading.Semaphore(2)
+def _person_classes(model) -> list[int]:
+    ids = [i for i, n in model.names.items() if any(k in n.lower() for k in ("person", "lying", "sitting", "standing"))]
+    return ids or [0]
+
 
 def detect_persons(frame, model_name: str):
-    """Unified person detection — dispatches to YOLO or PeopleNet."""
-    model_type, model_instance = get_model(model_name)
-
+    """Unified detection -> ndarray (N, 5) [x1, y1, x2, y2, conf]."""
+    model_type, model = get_model(model_name)
     with _inference_semaphore:
         if model_type == "yolo":
-            # Dynamically find which class IDs correspond to "person"
-            target_classes = []
-            for idx, name in model_instance.names.items():
-                name_lower = name.lower()
-                if "person" in name_lower or "lying" in name_lower or "sitting" in name_lower:
-                    target_classes.append(idx)
-            if not target_classes:
-                target_classes = [0] # fallback
-
-            res = model_instance.predict(frame, classes=target_classes, device=DEVICE, verbose=False, conf=0.2, imgsz=640)[0]
+            # MPS is not safe for concurrent predicts on one model -> serialize per model
+            with _yolo_locks[model_name]:
+                res = model.predict(frame, classes=_person_classes(model), device=DEVICE,
+                                    verbose=False, conf=0.25, imgsz=640)[0]
             boxes = res.boxes.xyxy.cpu().numpy()
             confs = res.boxes.conf.cpu().numpy().reshape(-1, 1)
-            # Add class ID as the 6th column if tracking wants to know it (optional, but good practice)
-            # Currently tracker expects (N, 5), so we leave it as [x1, y1, x2, y2, conf]
-            if len(boxes) > 0:
-                return np.concatenate([boxes, confs], axis=1)
-            return np.empty((0, 5))
-        elif model_type == "peoplenet":
-            return model_instance.detect(frame, conf_threshold=0.4, nms_iou=0.45)
+            return np.concatenate([boxes, confs], axis=1) if len(boxes) else np.empty((0, 5))
+        return model.detect(frame, conf_threshold=0.4, nms_iou=0.45)
+
+
+def model_info(name: str) -> dict:
+    mtype, path = MODEL_REGISTRY[name]
+    info = {"name": name, "type": mtype.value, "file": os.path.basename(path),
+            "size_mb": round(os.path.getsize(path) / 1e6, 1)}
+    if mtype == ModelType.YOLO:
+        info["backend"] = f"PyTorch / {DEVICE}"
+        info["description"] = "Ultralytics YOLO26 (end-to-end, NMS-free) person detector"
+    else:
+        info["backend"] = "ONNX Runtime / " + get_ort_providers()[0].replace("ExecutionProvider", "")
+        info["description"] = "NVIDIA PeopleNet ResNet34 INT8 (DetectNet_v2 GridBox, 960x544)"
+    if name in _loaded_models and mtype == ModelType.YOLO:
+        info["classes"] = list(_loaded_models[name][1].names.values())
+    return info
 
 
 # ============================================================================
-#  Video Discovery
+#  Video discovery
 # ============================================================================
+def _source_kind(path: str) -> str:
+    if path.startswith(STREAM_URL_PREFIXES):
+        return "stream"
+    if re.fullmatch(r"(webcam:)?\d+", path):
+        return "webcam"
+    return "file"
+
+
+def _video_meta(full_path: str) -> dict:
+    try:
+        cap = cv2.VideoCapture(full_path)
+        meta = {
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "fps": round(cap.get(cv2.CAP_PROP_FPS) or 0, 1),
+            "frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        }
+        cap.release()
+        meta["duration_s"] = round(meta["frames"] / meta["fps"], 1) if meta["fps"] else None
+        return meta
+    except Exception:
+        return {}
+
+
+_meta_cache: dict[str, dict] = {}
+
+
 def discover_videos():
-    """Find all video files in known directories."""
-    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".ts", ".flv"}
     videos = []
-
+    seen = set()
     for vdir in VIDEO_DIRS:
         if not os.path.isdir(vdir):
             continue
         for root, dirs, files in os.walk(vdir):
-            # Skip marked_* output directories
             dirs[:] = [d for d in dirs if not d.startswith("marked_")]
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext in video_exts:
-                    full_path = os.path.join(root, f)
-                    rel_path = os.path.relpath(full_path, PROJECT_ROOT)
-                    videos.append({
-                        "name": f,
-                        "path": rel_path.replace("\\", "/"),
-                        "full_path": full_path,
-                    })
+            for f in sorted(files):
+                if os.path.splitext(f)[1].lower() not in VIDEO_EXTS:
+                    continue
+                full = os.path.join(root, f)
+                if full in seen:
+                    continue
+                seen.add(full)
+                rel = os.path.relpath(full, PROJECT_ROOT).replace(os.sep, "/") if full.startswith(PROJECT_ROOT) else full
+                key = (full, os.path.getmtime(full))
+                if key not in _meta_cache:
+                    _meta_cache[key] = _video_meta(full)
+                videos.append({"name": f, "path": rel, "full_path": full,
+                               "folder": os.path.relpath(root, PROJECT_ROOT).replace(os.sep, "/") if root.startswith(PROJECT_ROOT) else root,
+                               **_meta_cache[key]})
     return videos
+
+
+def resolve_source(vp: str):
+    """Return (opencv_source, display_name) or raise FileNotFoundError."""
+    kind = _source_kind(vp)
+    if kind == "stream":
+        return vp, vp
+    if kind == "webcam":
+        return int(vp.split(":")[-1]), f"Webcam {vp.split(':')[-1]}"
+    for candidate in (os.path.join(PROJECT_ROOT, vp), vp, os.path.expanduser(vp)):
+        if os.path.isfile(candidate):
+            return candidate, os.path.basename(candidate)
+    raise FileNotFoundError(vp)
 
 
 # ============================================================================
@@ -567,36 +514,50 @@ rtmpose = RTMPoseWrapper()
 
 
 # ============================================================================
-#  Stream Processor — one per video stream
+#  Stream processor: one per video source
 # ============================================================================
 class StreamProcessor:
-    """
-    Processes a single video stream in a background thread.
-    Emulates live relay by reading frames at the video's native FPS.
-    Adaptively adjusts inference frequency to maintain ≥15 FPS output.
-    """
+    """Reads a source at native FPS in one thread and runs the pipeline in another.
+    Always processes the *latest* frame so the output stays live; slow hardware
+    simply lowers the effective inference FPS rather than building a backlog."""
 
-    def __init__(self, stream_id: str, video_path: str, model_name: str, frame_callback, target_fps=15):
+    def __init__(self, stream_id: str, source, display_name: str, model_name: str,
+                 frame_callback, target_fps=15.0, jpeg_quality=70):
         self.stream_id = stream_id
-        self.video_path = video_path
+        self.source = source
+        self.display_name = display_name
         self.model_name = model_name
         self.frame_callback = frame_callback
         self.target_fps = target_fps
+        self.jpeg_quality = jpeg_quality
 
         self._running = False
         self._reader_thread = None
         self._processor_thread = None
         self._loop = None
+        self._frame_queued = False
 
         self.current_fps = 0.0
+        self.latency_ms = 0.0
         self.person_count = 0
         self.frame_number = 0
         self.total_frames = 0
-        
+        self.native_fps = 0.0
+        self.source_frame_idx = 0
+        self.action_counts: dict[str, int] = {}
+        self.unique_ids: set[int] = set()
+        self.started_at = time.time()
+        self.last_error: Optional[str] = None
+
         self.latest_frame = None
         self.frame_lock = threading.Lock()
         self.new_frame_event = threading.Event()
 
+    @property
+    def is_live(self) -> bool:
+        return isinstance(self.source, int) or str(self.source).startswith(STREAM_URL_PREFIXES)
+
+    # -- lifecycle ---------------------------------------------------------
     def start(self, loop):
         if self._running:
             return
@@ -610,425 +571,373 @@ class StreamProcessor:
     def stop(self):
         self._running = False
         self.new_frame_event.set()
-        if self._reader_thread:
-            self._reader_thread.join(timeout=2)
-            self._reader_thread = None
-        if self._processor_thread:
-            self._processor_thread.join(timeout=2)
-            self._processor_thread = None
+        for t in (self._reader_thread, self._processor_thread):
+            if t:
+                t.join(timeout=3)
+        self._reader_thread = self._processor_thread = None
+
+    # -- reader ------------------------------------------------------------
+    def _open_capture(self):
+        if isinstance(self.source, int) and IS_MAC:
+            return cv2.VideoCapture(self.source, cv2.CAP_AVFOUNDATION)
+        return cv2.VideoCapture(self.source)
 
     def _read_frames(self):
         try:
-            cap = cv2.VideoCapture(self.video_path)
+            cap = self._open_capture()
             if not cap.isOpened():
-                self._send_error(f"Cannot open video: {self.video_path}")
+                self._send_error(f"Cannot open source: {self.display_name}")
                 return
-
-            native_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            frame_interval = 1.0 / native_fps
-
-            print(f"[Stream {self.stream_id}] Reader started — {self.video_path} @ {native_fps:.1f} FPS")
+            self.native_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not self.is_live else 0
+            frame_interval = 1.0 / self.native_fps
+            print(f"[{self.stream_id}] reader: {self.display_name} @ {self.native_fps:.1f} fps, {self.total_frames} frames")
 
             while self._running:
                 loop_start = time.time()
                 ret, frame = cap.read()
-                
                 if not ret:
-                    if self.video_path.startswith(("rtsp://", "http://", "https://")):
+                    if self.is_live:
                         self._send_error("Stream ended or disconnected.")
                         break
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop file sources
+                    self.source_frame_idx = 0
                     continue
+                self.source_frame_idx += 1
 
                 h, w = frame.shape[:2]
                 if h > 720 or w > 1280:
                     scale = min(1280.0 / w, 720.0 / h)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    frame = cv2.resize(frame, (new_w, new_h))
+                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
 
                 with self.frame_lock:
                     self.latest_frame = frame
                 self.new_frame_event.set()
 
-                if not self.video_path.startswith(("rtsp://", "http://", "https://")):
-                    total_elapsed = time.time() - loop_start
-                    sleep_time = frame_interval - total_elapsed
+                if not self.is_live:
+                    sleep_time = frame_interval - (time.time() - loop_start)
                     if sleep_time > 0:
                         time.sleep(sleep_time)
-
             cap.release()
-            print(f"[Stream {self.stream_id}] Reader stopped")
+            print(f"[{self.stream_id}] reader stopped")
         except Exception as e:
             traceback.print_exc()
             self._send_error(str(e))
 
+    # -- processor ---------------------------------------------------------
     def _process_frames(self):
-        import base64
         try:
             tracker = OCSortTracker(iou_threshold=0.25, max_lost=60, min_confidence=0.25)
-            track_history = {}
-            track_states = {}
-            tracked = []
-
-            fps_window = []
+            track_history: dict[int, list] = {}
+            track_states: dict[int, dict] = {}
+            fps_window: deque = deque(maxlen=30)
             target_interval = 1.0 / self.target_fps
-            print(f"[Stream {self.stream_id}] Processor started")
+            print(f"[{self.stream_id}] processor started ({self.model_name})")
 
             while self._running:
                 loop_start = time.time()
-                
                 if not self.new_frame_event.wait(timeout=1.0):
                     continue
-                
                 with self.frame_lock:
                     frame = self.latest_frame
                 self.new_frame_event.clear()
-                
                 if frame is None:
                     continue
 
-                process_start = time.time()
-                
+                t0 = time.time()
                 dets = detect_persons(frame, self.model_name)
-                tracked = tracker.update(dets.tolist() if len(dets) > 0 else [], frame)
+                tracked = tracker.update(dets.tolist() if len(dets) else [], frame)
 
                 active_ids = set()
-                rtmpose_count = 0 
-                
+                pose_budget = 3
                 for track in tracked:
-                    track_id = track["id"]
-                    active_ids.add(track_id)
+                    tid = track["id"]
+                    active_ids.add(tid)
+                    self.unique_ids.add(tid)
                     bbox = track["bbox"]
-
-                    if track_id not in track_history:
-                        track_history[track_id] = []
-                    if track_id not in track_states:
-                        track_states[track_id] = {"action": "STANDING", "conf": 0.5, "last_rtm_frame": 0}
-
-                    state = track_states[track_id]
-                    if self.frame_number - state.get("last_rtm_frame", 0) >= 3 and rtmpose_count < 2:
+                    track_history.setdefault(tid, [])
+                    state = track_states.setdefault(tid, {"action": "STANDING", "conf": 0.5, "last_rtm_frame": -10})
+                    if self.frame_number - state["last_rtm_frame"] >= 3 and pose_budget > 0:
                         roi, rx1, ry1 = crop_with_padding(frame, bbox, pad=20)
-                        if roi.size > 0:
+                        if roi.size > 0 and roi.shape[0] > 8 and roi.shape[1] > 8:
                             keypoints, scores = rtmpose.infer(roi)
-                            rtmpose_count += 1
-                            bbox_height = bbox[3] - bbox[1]
-                            track_history[track_id].append({
-                                "frame": self.frame_number,
-                                "kps": keypoints,
-                                "rx1": rx1,
-                                "ry1": ry1,
-                                "conf": scores,
-                            })
-                            if len(track_history[track_id]) > 30:
-                                track_history[track_id].pop(0)
-                            action, action_conf = classify_action(keypoints, track_history[track_id], bbox_height)
-                            state["action"] = action
-                            state["conf"] = action_conf
-                            state["last_rtm_frame"] = self.frame_number
+                            pose_budget -= 1
+                            track_history[tid].append({"frame": self.frame_number, "kps": keypoints, "rx1": rx1, "ry1": ry1, "conf": scores})
+                            if len(track_history[tid]) > 30:
+                                track_history[tid].pop(0)
+                            action, action_conf = classify_action(keypoints, track_history[tid], bbox[3] - bbox[1])
+                            state.update(action=action, conf=action_conf, last_rtm_frame=self.frame_number)
 
-                stale = [tid for tid in track_history if tid not in active_ids]
-                for tid in stale:
-                    if len(track_history.get(tid, [])) > 0:
-                        last_frame = track_history[tid][-1].get("frame", 0)
-                        if self.frame_number - last_frame > 120:
-                            del track_history[tid]
-                            track_states.pop(tid, None)
-                    else:
-                        del track_history[tid]
+                for tid in [t for t in track_history if t not in active_ids]:
+                    hist = track_history.get(tid) or []
+                    if not hist or self.frame_number - hist[-1].get("frame", 0) > 120:
+                        track_history.pop(tid, None)
                         track_states.pop(tid, None)
 
+                self.latency_ms = (time.time() - t0) * 1000.0
+
                 marked = frame.copy()
-                draw_annotations(marked, tracked, track_states, track_history)
-
-                model_label = f"Model: {self.model_name.upper()}"
-                cv2.putText(marked, model_label, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-
-                encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70]
-                _, buffer = cv2.imencode('.jpg', marked, encode_params)
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                draw_annotations(marked, tracked, track_states, track_history, draw_pose=rtmpose.available)
+                _, buffer = cv2.imencode(".jpg", marked, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                frame_b64 = base64.b64encode(buffer).decode("ascii")
 
                 tracks_info = []
                 for track in tracked:
                     tid = track["id"]
-                    state = track_states.get(tid, {"action": "STANDING", "conf": 0.5})
-                    tracks_info.append({
-                        "id": tid,
-                        "bbox": track["bbox"],
-                        "action": state["action"],
-                        "conf": round(state["conf"], 2),
-                    })
+                    st = track_states.get(tid, {"action": "STANDING", "conf": 0.5})
+                    tracks_info.append({"id": tid, "bbox": [round(v, 1) for v in track["bbox"]],
+                                        "score": round(track["score"], 2), "action": st["action"], "conf": round(st["conf"], 2)})
+                self.action_counts = dict(Counter(t["action"] for t in tracks_info))
 
                 fps_window.append(time.time())
-                if len(fps_window) > 30:
-                    fps_window.pop(0)
                 if len(fps_window) >= 2:
                     elapsed = fps_window[-1] - fps_window[0]
-                    self.current_fps = (len(fps_window) - 1) / elapsed if elapsed > 0 else 0
-                else:
-                    self.current_fps = 0
-
+                    self.current_fps = (len(fps_window) - 1) / elapsed if elapsed > 0 else 0.0
                 self.person_count = len(tracked)
                 self.frame_number += 1
 
-                frame_data = {
+                self._send_frame({
                     "type": "frame",
                     "stream_id": self.stream_id,
+                    "source": self.display_name,
                     "frame": frame_b64,
+                    "width": marked.shape[1],
+                    "height": marked.shape[0],
                     "fps": round(self.current_fps, 1),
+                    "latency_ms": round(self.latency_ms, 1),
                     "person_count": self.person_count,
+                    "unique_persons": len(self.unique_ids),
+                    "actions": self.action_counts,
                     "tracks": tracks_info,
                     "frame_number": self.frame_number,
+                    "source_frame": self.source_frame_idx,
                     "total_frames": self.total_frames,
+                    "native_fps": round(self.native_fps, 1),
                     "model": self.model_name,
-                    "infer_every_n": 1, 
-                }
-                self._send_frame(frame_data)
+                    "device": DEVICE if MODEL_REGISTRY[self.model_name][0] == ModelType.YOLO else get_ort_providers()[0],
+                    "ts": time.time(),
+                })
 
-                process_elapsed = time.time() - loop_start
-                sleep_time = target_interval - process_elapsed
+                sleep_time = target_interval - (time.time() - loop_start)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-
-            print(f"[Stream {self.stream_id}] Processor stopped")
+            print(f"[{self.stream_id}] processor stopped")
         except Exception as e:
             traceback.print_exc()
             self._send_error(str(e))
 
+    # -- delivery ----------------------------------------------------------
     def _send_frame(self, data: dict):
-        """Thread-safe: schedule frame delivery on the asyncio event loop."""
-        if self._loop and self._running:
-            if getattr(self, '_frame_queued', False):
-                return  # Drop frame to prevent memory leak!
-            self._frame_queued = True
-            
-            async def wrapped():
-                try:
-                    await self.frame_callback(data)
-                finally:
-                    self._frame_queued = False
-                    
+        if not (self._loop and self._running):
+            return
+        if self._frame_queued:
+            return  # drop frame: never let a slow client build a backlog
+        self._frame_queued = True
+
+        async def wrapped():
+            try:
+                await self.frame_callback(data)
+            finally:
+                self._frame_queued = False
+
+        try:
             asyncio.run_coroutine_threadsafe(wrapped(), self._loop)
+        except RuntimeError:
+            self._frame_queued = False
 
     def _send_error(self, message: str):
+        self.last_error = message
         if self._loop:
-            error_data = {"type": "error", "stream_id": self.stream_id, "message": message}
-            asyncio.run_coroutine_threadsafe(self.frame_callback(error_data), self._loop)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.frame_callback({"type": "error", "stream_id": self.stream_id, "message": message}), self._loop)
+            except RuntimeError:
+                pass
+
+    def status(self) -> dict:
+        return {
+            "stream_id": self.stream_id,
+            "source": self.display_name,
+            "model": self.model_name,
+            "fps": round(self.current_fps, 1),
+            "latency_ms": round(self.latency_ms, 1),
+            "person_count": self.person_count,
+            "unique_persons": len(self.unique_ids),
+            "actions": self.action_counts,
+            "frame_number": self.frame_number,
+            "total_frames": self.total_frames,
+            "native_fps": round(self.native_fps, 1),
+            "uptime_s": round(time.time() - self.started_at, 1),
+            "running": self._running,
+            "error": self.last_error,
+        }
 
 
 # ============================================================================
-#  FastAPI Application
+#  FastAPI application
 # ============================================================================
-app = FastAPI(title="CV Pipeline Dashboard", version="1.0.0")
+app = FastAPI(title="Unified CV Pipeline", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Global state
 active_streams: dict[str, StreamProcessor] = {}
 ws_clients: set[WebSocket] = set()
 _streams_lock = threading.Lock()
+_pipeline_started_at: Optional[float] = None
+_current_config: dict = {}
 
 
-async def broadcast_frame(data: dict):
-    """Send frame data to all connected WebSocket clients."""
-    global ws_clients
-    dead_clients = set()
+async def broadcast(data: dict):
+    dead = set()
     for ws in ws_clients.copy():
         try:
             await ws.send_json(data)
         except Exception:
-            dead_clients.add(ws)
-    ws_clients -= dead_clients
+            dead.add(ws)
+    for ws in dead:
+        ws_clients.discard(ws)
 
 
-# --- REST Endpoints ---
+# --- REST -------------------------------------------------------------------
+@app.get("/api/system")
+async def api_system():
+    info = system_summary()
+    info.update({
+        "rtmpose_available": rtmpose.available,
+        "models": [model_info(n) for n in MODEL_REGISTRY],
+        "video_dirs": VIDEO_DIRS,
+        "max_streams": MAX_STREAMS,
+    })
+    return info
+
 
 @app.get("/api/models")
-async def list_models():
-    """List available CV models."""
-    models = []
-    for name, (mtype, path) in MODEL_REGISTRY.items():
-        models.append({
-            "name": name,
-            "type": mtype.value,
-            "file": os.path.basename(path),
-        })
-    # Sort: peoplenet first, then by name
+async def api_models():
+    models = [model_info(n) for n in MODEL_REGISTRY]
     models.sort(key=lambda m: (0 if m["name"] == "peoplenet" else 1, m["name"]))
     return {"models": models}
 
 
 @app.get("/api/videos")
-async def list_videos():
-    """List available video files."""
-    videos = discover_videos()
-    return {"videos": videos}
+async def api_videos():
+    return {"videos": discover_videos()}
+
 
 class FolderRequest(BaseModel):
     path: str
 
+
 @app.post("/api/folders")
-async def add_folder(req: FolderRequest):
-    """Add a new folder to the video discovery list."""
-    if not os.path.isdir(req.path):
-        return JSONResponse(status_code=400, content={"error": "Invalid folder path. Does not exist."})
-        
-    if req.path not in VIDEO_DIRS:
-        VIDEO_DIRS.append(req.path)
-        
+async def api_add_folder(req: FolderRequest):
+    path = os.path.expanduser(req.path)
+    if not os.path.isdir(path):
+        return JSONResponse(status_code=400, content={"error": f"Folder does not exist: {req.path}"})
+    if path not in VIDEO_DIRS:
+        VIDEO_DIRS.append(path)
     return {"message": "Folder added", "videos": discover_videos()}
 
 
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in VIDEO_EXTS:
+        return JSONResponse(status_code=400, content={"error": f"Unsupported file type: {ext or 'unknown'}"})
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(file.filename))
+    dest = os.path.join(UPLOAD_DIR, safe)
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+    rel = os.path.relpath(dest, PROJECT_ROOT).replace(os.sep, "/")
+    return {"message": "Uploaded", "path": rel, "videos": discover_videos()}
+
+
 @app.get("/api/status")
-async def pipeline_status():
-    """Get current pipeline status."""
-    streams_info = {}
+async def api_status():
     with _streams_lock:
-        for sid, sp in active_streams.items():
-            streams_info[sid] = {
-                "stream_id": sid,
-                "video": sp.video_path,
-                "model": sp.model_name,
-                "fps": round(sp.current_fps, 1),
-                "person_count": sp.person_count,
-                "frame_number": sp.frame_number,
-                "total_frames": sp.total_frames,
-                "infer_every_n": sp.infer_every_n,
-                "running": sp._running,
-            }
+        streams = {sid: sp.status() for sid, sp in active_streams.items()}
     return {
-        "running": len(active_streams) > 0,
-        "stream_count": len(active_streams),
-        "streams": streams_info,
+        "running": len(streams) > 0,
+        "stream_count": len(streams),
+        "streams": streams,
         "ws_clients": len(ws_clients),
+        "config": _current_config,
+        "uptime_s": round(time.time() - _pipeline_started_at, 1) if _pipeline_started_at else 0,
+        "device": DEVICE,
     }
 
 
 @app.post("/api/start")
-async def start_pipeline(config: dict):
-    """
-    Start the CV pipeline.
-    Body: { "model": "yolo26n", "mode": "single"|"multi", "videos": ["path1", ...] }
-    """
-    model_name = config.get("model", "yolo26n")
+async def api_start(config: dict):
+    global _pipeline_started_at, _current_config
+    model_name = config.get("model") or next(iter(MODEL_REGISTRY), None)
     mode = config.get("mode", "single")
-    video_paths = config.get("videos", [])
-
+    video_paths = [v for v in config.get("videos", []) if v]
     if not video_paths:
-        return JSONResponse(status_code=400, content={"error": "No videos specified"})
-
+        return JSONResponse(status_code=400, content={"error": "No video sources specified"})
     if model_name not in MODEL_REGISTRY:
-        return JSONResponse(status_code=400, content={
-            "error": f"Unknown model: {model_name}",
-            "available": list(MODEL_REGISTRY.keys())
-        })
+        return JSONResponse(status_code=400, content={"error": f"Unknown model: {model_name}", "available": list(MODEL_REGISTRY)})
 
-    # Stop existing streams
-    await stop_pipeline()
+    await api_stop()
 
-    # Resolve video paths
     resolved = []
-    for vp in video_paths:
-        if vp.startswith(("rtsp://", "http://", "https://")):
-            resolved.append(vp)
-            continue
-        full = os.path.join(PROJECT_ROOT, vp)
-        if os.path.exists(full):
-            resolved.append(full)
-        elif os.path.exists(vp):
-            resolved.append(vp)
-        else:
+    for vp in video_paths[: (1 if mode == "single" else MAX_STREAMS)]:
+        try:
+            resolved.append(resolve_source(vp))
+        except FileNotFoundError:
             return JSONResponse(status_code=400, content={"error": f"Video not found: {vp}"})
 
-    if mode == "single":
-        resolved = resolved[:1]
-    else:
-        resolved = resolved[:4]  # max 4 streams
-
-    # Pre-load the model (so first frame isn't slow)
     try:
-        get_model(model_name)
+        await asyncio.get_running_loop().run_in_executor(None, get_model, model_name)
     except Exception as e:
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": f"Failed to load model: {e}"})
 
-    # Set target FPS based on mode
-    target_fps = 25.0 if mode == "single" else 15.0
-
-    loop = asyncio.get_event_loop()
+    target_fps = float(config.get("target_fps") or (25.0 if mode == "single" else 15.0))
+    jpeg_quality = int(config.get("jpeg_quality") or (75 if mode == "single" else 60))
+    loop = asyncio.get_running_loop()
 
     with _streams_lock:
-        for i, vpath in enumerate(resolved):
+        for i, (src, name) in enumerate(resolved):
             sid = f"stream_{i}"
-            sp = StreamProcessor(
-                stream_id=sid,
-                video_path=vpath,
-                model_name=model_name,
-                frame_callback=broadcast_frame,
-                target_fps=target_fps,
-            )
+            sp = StreamProcessor(sid, src, name, model_name, broadcast, target_fps=target_fps, jpeg_quality=jpeg_quality)
             active_streams[sid] = sp
             sp.start(loop)
+    _pipeline_started_at = time.time()
+    _current_config = {"model": model_name, "mode": mode, "videos": video_paths[: len(resolved)], "target_fps": target_fps}
 
-    # Broadcast status
-    await broadcast_frame({
-        "type": "status",
-        "message": f"Started {len(resolved)} stream(s) with {model_name}",
-        "mode": mode,
-        "stream_count": len(resolved),
-    })
-
-    return {
-        "status": "started",
-        "mode": mode,
-        "model": model_name,
-        "streams": len(resolved),
-    }
+    await broadcast({"type": "status", "status": "started", "message": f"Started {len(resolved)} stream(s) with {model_name}",
+                     "mode": mode, "model": model_name, "stream_count": len(resolved),
+                     "streams": [{"stream_id": f"stream_{i}", "source": n} for i, (_, n) in enumerate(resolved)]})
+    return {"status": "started", "mode": mode, "model": model_name, "streams": len(resolved)}
 
 
 @app.post("/api/stop")
-async def stop_pipeline():
-    """Stop all active streams."""
+async def api_stop():
+    global _pipeline_started_at, _current_config
     with _streams_lock:
-        for sid, sp in active_streams.items():
-            sp.stop()
+        procs = list(active_streams.values())
         active_streams.clear()
-
-    await broadcast_frame({"type": "status", "message": "Pipeline stopped", "stream_count": 0})
+    if procs:
+        await asyncio.get_running_loop().run_in_executor(None, lambda: [p.stop() for p in procs])
+    _pipeline_started_at = None
+    _current_config = {}
+    await broadcast({"type": "status", "status": "stopped", "message": "Pipeline stopped", "stream_count": 0})
     return {"status": "stopped"}
 
 
-# --- WebSocket Endpoint ---
-
+# --- WebSocket --------------------------------------------------------------
 @app.websocket("/ws/stream")
 async def websocket_stream(ws: WebSocket):
-    """WebSocket endpoint for live frame streaming."""
     await ws.accept()
     ws_clients.add(ws)
-    print(f"[WS] Client connected. Total: {len(ws_clients)}")
-
+    print(f"[WS] client connected ({len(ws_clients)} total)")
     try:
-        # Send initial status
-        await ws.send_json({
-            "type": "status",
-            "message": "Connected to CV Pipeline Server",
-            "stream_count": len(active_streams),
-            "models": list(MODEL_REGISTRY.keys()),
-        })
-
-        # Keep connection alive — listen for control messages
+        await ws.send_json({"type": "status", "status": "connected", "message": "Connected to CV Pipeline Server",
+                            "stream_count": len(active_streams), "models": list(MODEL_REGISTRY), "device": DEVICE})
         while True:
             try:
-                data = await ws.receive_text()
-                msg = json.loads(data)
-                # Client can send ping/pong or control messages
+                msg = json.loads(await ws.receive_text())
                 if msg.get("type") == "ping":
-                    await ws.send_json({"type": "pong"})
+                    await ws.send_json({"type": "pong", "ts": time.time()})
             except WebSocketDisconnect:
                 break
             except json.JSONDecodeError:
@@ -1037,18 +946,37 @@ async def websocket_stream(ws: WebSocket):
         pass
     finally:
         ws_clients.discard(ws)
-        print(f"[WS] Client disconnected. Total: {len(ws_clients)}")
+        print(f"[WS] client disconnected ({len(ws_clients)} total)")
+
+
+# --- Static dashboard (built with `npm run build` in ./dashboard) ------------
+DASHBOARD_DIST = os.path.join(PROJECT_ROOT, "dashboard", "dist")
+if os.path.isfile(os.path.join(DASHBOARD_DIST, "index.html")):
+    app.mount("/", StaticFiles(directory=DASHBOARD_DIST, html=True), name="dashboard")
+    print(f"[server] serving dashboard from {DASHBOARD_DIST}")
+else:
+    @app.get("/")
+    async def root():
+        return {"message": "Unified CV Pipeline API. Build the dashboard (cd dashboard && npm run build) or run it with `npm run dev`.",
+                "docs": "/docs"}
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await api_stop()
 
 
 # ============================================================================
-#  Entry Point
+#  Entry point
 # ============================================================================
 if __name__ == "__main__":
-    print(f"\n{'='*60}")
-    print(f"  CV Pipeline Dashboard Server")
-    print(f"  Models: {list(MODEL_REGISTRY.keys())}")
-    print(f"  Videos: {len(discover_videos())} files found")
-    print(f"  Device: {DEVICE}")
-    print(f"{'='*60}\n")
-
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    print(f"\n{'=' * 64}\n  Unified CV Pipeline Server\n"
+          f"  Platform : {platform.system()} {platform.machine()}\n"
+          f"  Device   : {DEVICE} ({device_name()})\n"
+          f"  ORT      : {get_ort_providers()}\n"
+          f"  Models   : {list(MODEL_REGISTRY)}\n"
+          f"  Videos   : {len(discover_videos())} files\n"
+          f"  URL      : http://localhost:{port}\n{'=' * 64}\n")
+    uvicorn.run(app, host=host, port=port, log_level="info")

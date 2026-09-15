@@ -5,8 +5,8 @@ import torch
 from ultralytics import YOLO
 
 #dataset link: https://www.kaggle.com/datasets/fmena14/crowd-counting
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
+from platform_utils import DEVICE, device_name, make_ocsort, make_ort_session  # CUDA -> MPS (macOS) -> CPU
+print(f"Using device: {DEVICE} ({device_name()})")
 
 model = YOLO("yolo26n.pt")
 model.to(DEVICE)  # or just pass device during inference

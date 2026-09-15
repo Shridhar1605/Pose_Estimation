@@ -5,12 +5,11 @@ import numpy as np
 import torch
 from enum import Enum
 from ultralytics import YOLO
-from boxmot.trackers.bbox.ocsort.ocsort import OcSort
 import torchvision
 
 # dataset link: https://www.kaggle.com/datasets/fmena14/crowd-counting
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
+from platform_utils import DEVICE, device_name, make_ocsort, make_ort_session  # CUDA -> MPS (macOS) -> CPU
+print(f"Using device: {DEVICE} ({device_name()})")
 
 model = YOLO("yolo26n.pt")
 model.to(DEVICE)  # or just pass device during inference
@@ -20,10 +19,8 @@ class RTMPoseWrapper:
         self.model_path = model_path
         self.session = None
         if os.path.exists(self.model_path):
-            import onnxruntime as ort
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            print(f"Loaded RTMPose from {self.model_path}")
+            self.session = make_ort_session(self.model_path, log_prefix="[RTMPose]")
+            print(f"Loaded RTMPose from {self.model_path} | providers: {self.session.get_providers()}")
         else:
             print(f"Warning: {self.model_path} not found. Using dummy keypoints for testing.")
 
@@ -182,28 +179,8 @@ def detect_persons_robust(image):
 
 class OCSortTracker:
     def __init__(self, iou_threshold=0.25, max_lost=60, min_confidence=0.25):
-        # We try to pass the tuned parameters; if the underlying BoxMOT OcSort doesn't 
-        # accept delta_t, asso_func, inertia, we fall back to the safe parameters.
-        try:
-            self.tracker = OcSort(
-                det_thresh=min_confidence,
-                max_age=max_lost,
-                min_hits=2,
-                iou_threshold=iou_threshold,
-                delta_t=3,              # from user plan
-                asso_func="iou",        # from user plan
-                inertia=0.2,            # from user plan
-                per_class=False
-            )
-        except TypeError:
-            print("Warning: Strict OC-SORT parameters failed, falling back to supported kwargs")
-            self.tracker = OcSort(
-                det_thresh=min_confidence,
-                max_age=max_lost,
-                min_hits=2,
-                iou_threshold=iou_threshold,
-                per_class=False
-            )
+        # boxmot-version-agnostic factory (handles 21.x and 25.x import paths / kwargs)
+        self.tracker = make_ocsort(iou_threshold, max_lost, min_confidence)
 
     def update(self, detections, frame=None):
         if len(detections) == 0:
@@ -220,7 +197,7 @@ class OCSortTracker:
         
         tracked = []
         for r in res:
-            x1, y1, x2, y2, track_id, conf, cls, ind = r
+            x1, y1, x2, y2, track_id, conf = r[:6]
             tracked.append({
                 "id": int(track_id),
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],

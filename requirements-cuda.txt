@@ -1,0 +1,5 @@
+# NVIDIA GPU (Linux / Windows) add-on. Install AFTER requirements.txt:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   pip uninstall -y onnxruntime && pip install onnxruntime-gpu
+# Then run as usual; platform_utils.py picks CUDA for both torch and ONNX Runtime.
+onnxruntime-gpu>=1.18

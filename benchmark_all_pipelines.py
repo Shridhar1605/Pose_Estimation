@@ -78,7 +78,9 @@ def start_server():
     """Start the FastAPI backend server."""
     global server_proc
     print("\n[Benchmark] Starting backend server...")
-    python_exe = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
+    python_exe = os.path.join(PROJECT_ROOT, ".venv", "bin", "python")          # macOS / Linux
+    if not os.path.exists(python_exe):
+        python_exe = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")  # Windows
     if not os.path.exists(python_exe):
         python_exe = sys.executable
 
@@ -89,6 +91,7 @@ def start_server():
         stderr=subprocess.STDOUT,
         text=True,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
     )
     # Wait for server to be ready
     for attempt in range(30):
@@ -109,14 +112,16 @@ def start_frontend():
     """Start the Vite dev server for the dashboard."""
     global frontend_proc
     print("[Benchmark] Starting frontend dev server...")
+    npm = "npm.cmd" if os.name == "nt" else "npm"
     frontend_proc = subprocess.Popen(
-        ["npm", "run", "dev"],
+        [npm, "run", "dev"],
         cwd=os.path.join(PROJECT_ROOT, "dashboard"),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        shell=True,
+        shell=False,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
     )
     # Wait for Vite to be ready
     for attempt in range(15):

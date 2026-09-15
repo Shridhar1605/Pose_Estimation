@@ -3,17 +3,19 @@ import cv2
 import numpy as np
 import os
 
-model_path = r"F:\Other\Internship-Neelaminds\_\resnet34_peoplenet_int8.onnx"
+from platform_utils import get_ort_providers
+HERE = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(HERE, "_", "resnet34_peoplenet_int8.onnx")
 print('model_path', model_path)
 print('exists', os.path.exists(model_path))
 
-providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+providers = get_ort_providers()
 sess = ort.InferenceSession(model_path, providers=providers)
 print('providers', sess.get_providers())
 print('inputs', [(i.name, i.shape, i.type) for i in sess.get_inputs()])
 print('outputs', [(o.name, o.shape, o.type) for o in sess.get_outputs()])
 
-img_path = r"F:\Other\Internship-Neelaminds\images\1.jpg"
+img_path = os.path.join(HERE, "dummy.jpg")
 print('img exists', os.path.exists(img_path))
 img = cv2.imread(img_path)
 if img is None:

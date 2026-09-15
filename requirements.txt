@@ -1,11 +1,20 @@
-# Combined requirements for PeopleNetProto.py and pipelinePrototype.py
-# This set is based on the current virtual environment in the workspace.
-# If you only need CPU inference, replace onnxruntime-gpu with onnxruntime.
-
-boxmot==21.0.0
-numpy==2.4.4
-opencv-python==4.13.0.92
-onnxruntime-gpu==1.26.0
-torch==2.11.0+cu128
-torchvision==0.26.0+cu128
-ultralytics==8.4.63
+# Unified CV pipeline (server.py + all prototype scripts)
+# Cross-platform: macOS (Apple Silicon / Intel), Linux, Windows.
+#
+#   python3.12 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# macOS  : torch uses Metal (MPS), onnxruntime uses CoreML automatically.
+# CUDA   : additionally follow requirements-cuda.txt.
+torch>=2.4
+torchvision>=0.19
+ultralytics>=8.3.0          # YOLO26 support
+boxmot>=13.0                # OC-SORT (import path handled in platform_utils.py)
+onnxruntime>=1.18           # CPU + CoreML (macOS) execution providers
+opencv-python>=4.9
+numpy>=1.26
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12
+python-multipart>=0.0.9     # video upload endpoint
+requests>=2.31              # benchmark / test clients

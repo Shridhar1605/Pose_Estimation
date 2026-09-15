@@ -7,9 +7,9 @@ import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ultralytics import YOLO
 # dataset link: https://www.kaggle.com/datasets/fmena14/crowd-counting
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
-model = YOLO("yolov8x.pt")
+from platform_utils import DEVICE, device_name, make_ocsort, make_ort_session  # CUDA -> MPS (macOS) -> CPU
+print(f"Using device: {DEVICE} ({device_name()})")
+model = YOLO("yolo26m_person.pt")  # fine-tuned single-class person model
 if hasattr(model, "to"):
     model.to(DEVICE)
 def detect_persons(source):

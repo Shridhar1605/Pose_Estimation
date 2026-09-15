@@ -31,16 +31,9 @@ Usage
 
 import os
 
-# ── Force UTF-8 output on Windows to avoid cp1252 UnicodeEncodeError ─────────
-import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-# ── GPU / CUDA device selection ──────────────────────────────────────────────
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# ── Cross-platform device / runtime selection (macOS MPS+CoreML, CUDA, CPU) ──
+# platform_utils also forces UTF-8 console output on every OS.
+from platform_utils import DEVICE as _PLATFORM_DEVICE, device_name, get_ort_providers, make_ort_session
 
 import argparse
 import sys
@@ -133,8 +126,8 @@ def activate_cuda_device(device_index: int = 0) -> str:
         return "cpu"
 
 
-DEVICE = activate_cuda_device(0)
-print(f"Using device      : {DEVICE}\n")
+DEVICE = activate_cuda_device(0) if _PLATFORM_DEVICE.startswith("cuda") else _PLATFORM_DEVICE
+print(f"Using device      : {DEVICE} ({device_name()})\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,14 +151,11 @@ def load_peoplenet_model(model_path: str | None = None) -> "ort.InferenceSession
         )
 
     available = ort.get_available_providers()
-    providers  = []
-    if "CUDAExecutionProvider" in available:
-        providers.append("CUDAExecutionProvider")
-    providers.append("CPUExecutionProvider")
+    providers  = get_ort_providers()          # CUDA -> CoreML (macOS) -> CPU
     print(f"ORT providers available : {available}")
     print(f"ORT providers selected  : {providers}")
 
-    session = ort.InferenceSession(model_path, providers=providers)
+    session = make_ort_session(model_path, providers, log_prefix="[PeopleNet]")
     inp = session.get_inputs()[0]
     print(f"Model input  : {inp.name}  shape={inp.shape}  dtype={inp.type}")
     for out in session.get_outputs():

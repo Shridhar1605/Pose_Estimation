@@ -1,18 +1,32 @@
+# Videos: never commit footage
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+*.flv
 Video_samples/
 Pose_Samples/
-pipeline_screenshots/
-marked_videos_Yolo/
-marked_videos_OCSort/
-marked_videos_ByteTrack/
-marked_videos_2/
-marked_videos_1/
-marked_videos/
+videos/
 Internship project resource videos/
+marked_videos*/
+pipeline_screenshots/
 Image samples/
-dashboard/
+
+# Environments and caches
 .venv/
 __pycache__/
-*.pt
+*.pyc
+.DS_Store
+*.bak
+*.part
+
+# Large datasets
 *.npy
-_
-*.onnx
+
+# Dashboard build output
+dashboard/node_modules/
+dashboard/dist/

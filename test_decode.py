@@ -26,7 +26,8 @@ def decode_peoplenet(cov, bbox, STRIDE=16, conf_thresh=0.2):
 
     return np.stack([x1, y1, x2, y2, scores], axis=1)
 
-sess = ort.InferenceSession('_/resnet34_peoplenet_int8.onnx', providers=['CPUExecutionProvider'])
+from platform_utils import make_ort_session
+sess = make_ort_session('_/resnet34_peoplenet_int8.onnx')
 
 img = cv2.imread('dummy.jpg')
 if img is None:
